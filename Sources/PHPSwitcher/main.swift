@@ -19,10 +19,42 @@ if CommandLine.arguments.contains("--probe") {
         ].compactMap { $0 }.joined(separator: "+")
         print("  \(install.shortVersion)\t\(install.version)\t\(install.formula)\t\(flags)")
     }
+    let mysql = state.mysql
+    print("mysql CLI:        \(mysql.linkedFormula ?? "none") \(mysql.linkedVersion ?? "")")
+    print("mysql server:     \(mysql.serverFormula ?? "none") \(mysql.serverVersion ?? "")")
+    print("mysql services:   \(mysql.loadedServiceFormulas.joined(separator: ", "))")
+    print("mysql installed:")
+    for install in mysql.installs {
+        let flags = [
+            mysql.linkedFormula == install.formula ? "cli" : nil,
+            mysql.serverFormula == install.formula ? "server" : nil,
+        ].compactMap { $0 }.joined(separator: "+")
+        print("  \(install.shortVersion)\t\(install.version)\t\(install.formula)\t\(flags)")
+        let dir = MySQLDetector.dataDir(for: install.formula)
+        print("      data \(dir.path) (\(mysql.dataVersions[install.formula] ?? "not created yet"))")
+    }
     exit(0)
 }
 
+// `PHPSwitcher --copy-db <name>` copies one database into the separate 8.4 data dir, like the menu.
+if let index = CommandLine.arguments.firstIndex(of: "--copy-db") {
+    guard index + 1 < CommandLine.arguments.count else {
+        print("usage: PHPSwitcher --copy-db <database>")
+        exit(2)
+    }
+    let name = CommandLine.arguments[index + 1]
+    switch MySQLCopy.copy(database: name, state: PHPDetector.detect().mysql, progress: { print($0) }) {
+    case .success:
+        print("copied \(name)")
+        exit(0)
+    case .failed(let result):
+        print("FAILED: \(result.command)\nexit \(result.exitCode)\n\(result.message)")
+        exit(1)
+    }
+}
+
 // `PHPSwitcher --switch php@8.4` runs the same switch sequence the menu uses, from a terminal.
+// `--switch mysql@9.7` does the same for MySQL; add `--force` to accept a data dir upgrade/downgrade.
 if let index = CommandLine.arguments.firstIndex(of: "--switch") {
     guard index + 1 < CommandLine.arguments.count else {
         print("usage: PHPSwitcher --switch <formula>")
@@ -30,6 +62,31 @@ if let index = CommandLine.arguments.firstIndex(of: "--switch") {
     }
     let formula = CommandLine.arguments[index + 1]
     let state = PHPDetector.detect()
+
+    if let install = state.mysql.install(named: formula) {
+        let data = state.mysql.dataVersions[formula] ?? ""
+        let force = CommandLine.arguments.contains("--force")
+        switch state.mysql.compatibility(of: install) {
+        case .upgrade where !force:
+            print("Refusing: \(formula) would upgrade the data dir from \(data) one way. Pass --force to go ahead.")
+            exit(1)
+        case .downgrade where !force:
+            print("Refusing: \(formula) cannot open data from \(data); mysqld would not start. Pass --force to switch anyway.")
+            exit(1)
+        default:
+            break
+        }
+        switch Switcher.switchMySQL(install, state: state.mysql, progress: { print($0) }) {
+        case .success:
+            let after = PHPDetector.detect().mysql
+            print("now: CLI \(after.linkedVersion ?? "none")  server \(after.serverVersion ?? "stopped")")
+            exit(0)
+        case .failed(let result):
+            print("FAILED: \(result.command)\nexit \(result.exitCode)\n\(result.message)")
+            exit(1)
+        }
+    }
+
     guard let install = state.install(named: formula) else {
         print("No installed formula named \(formula)")
         exit(1)

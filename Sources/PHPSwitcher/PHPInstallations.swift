@@ -1,7 +1,7 @@
 import Foundation
 
-/// One installed Homebrew PHP keg.
-struct PHPInstall: Equatable {
+/// One installed Homebrew keg (php, php@8.4, mysql@9.7, ...).
+struct Keg: Equatable {
     /// Formula name as brew knows it: "php", "php@8.4", ...
     let formula: String
     /// Full version from the Cellar directory: "8.4.25", "7.4.33_13".
@@ -24,7 +24,7 @@ struct PHPInstall: Equatable {
 
 /// A snapshot of what PHP is installed and what is currently active.
 struct PHPState {
-    var installs: [PHPInstall] = []
+    var installs: [Keg] = []
     /// Formula the `php` CLI symlink currently resolves to, if any.
     var linkedFormula: String?
     var linkedVersion: String?
@@ -38,17 +38,19 @@ struct PHPState {
     var nginxRunning: Bool = false
     /// Where the vhost files live, if that folder exists.
     var sitesFolder: URL?
+    /// MySQL kegs, link and server state.
+    var mysql = MySQLState()
     /// Set when Homebrew itself could not be found.
     var brewMissing: Bool = false
 
     var linkedShortVersion: String? {
-        linkedVersion.map { PHPInstall(formula: "", version: $0).shortVersion }
+        linkedVersion.map { Keg(formula: "", version: $0).shortVersion }
     }
     var fpmShortVersion: String? {
-        fpmVersion.map { PHPInstall(formula: "", version: $0).shortVersion }
+        fpmVersion.map { Keg(formula: "", version: $0).shortVersion }
     }
 
-    func install(named formula: String) -> PHPInstall? {
+    func install(named formula: String) -> Keg? {
         installs.first { $0.formula == formula }
     }
 }
@@ -80,6 +82,7 @@ enum PHPDetector {
             atPath: Brew.cellarURL.appendingPathComponent("nginx").path
         )
         state.nginxRunning = loaded.contains("nginx")
+        state.mysql = MySQLDetector.detect(loaded: loaded)
         state.sitesFolder = sitesFolder()
         if let fpm = runningFPM(installs: state.installs, loaded: state.loadedServiceFormulas) {
             state.fpmFormula = fpm
@@ -89,20 +92,25 @@ enum PHPDetector {
     }
 
     /// Every php keg under <prefix>/Cellar, newest version first.
-    static func installedVersions() -> [PHPInstall] {
+    static func installedVersions() -> [Keg] {
+        kegs(matching: formulaPattern)
+    }
+
+    /// Every keg under <prefix>/Cellar whose formula name matches `pattern`, newest version first.
+    static func kegs(matching pattern: NSRegularExpression) -> [Keg] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: Brew.cellarURL.path) else {
             return []
         }
-        var installs: [PHPInstall] = []
+        var installs: [Keg] = []
         for entry in entries {
             let range = NSRange(entry.startIndex..., in: entry)
-            guard formulaPattern.firstMatch(in: entry, range: range) != nil else { continue }
+            guard pattern.firstMatch(in: entry, range: range) != nil else { continue }
             let kegDir = Brew.cellarURL.appendingPathComponent(entry)
             guard let versions = try? fm.contentsOfDirectory(atPath: kegDir.path) else { continue }
             let candidates = versions
                 .filter { !$0.hasPrefix(".") }
-                .map { PHPInstall(formula: entry, version: $0) }
+                .map { Keg(formula: entry, version: $0) }
                 .sorted { $0.sortKey > $1.sortKey }
             if let newest = candidates.first { installs.append(newest) }
         }
@@ -156,7 +164,7 @@ enum PHPDetector {
             let pid = columns[0].trimmingCharacters(in: .whitespaces)
             let label = columns[2].trimmingCharacters(in: .whitespaces)
             guard Int(pid) != nil else { continue }  // "-" means loaded but not running
-            for domain in ["sh.brew.", "homebrew.mxcl."] where label.hasPrefix(domain) {
+            for domain in ["sh.brew.", "homebrew.mxcl.", MySQLService.labelPrefix] where label.hasPrefix(domain) {
                 let formula = String(label.dropFirst(domain.count))
                 if !formula.isEmpty, !formulas.contains(formula) {
                     formulas.append(formula)
@@ -170,7 +178,7 @@ enum PHPDetector {
     ///
     /// Prefers the launchd label, but cross-checks against the master process's config path
     /// so a loaded-but-dead job does not read as running.
-    static func runningFPM(installs: [PHPInstall], loaded: [String]) -> String? {
+    static func runningFPM(installs: [Keg], loaded: [String]) -> String? {
         guard let confShortVersion = runningFPMConfigVersion() else { return nil }
         // Match the launchd label whose keg matches the live master process.
         for formula in loaded {

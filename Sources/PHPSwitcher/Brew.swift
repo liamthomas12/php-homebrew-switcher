@@ -132,6 +132,9 @@ enum Brew {
     static var etcNginxURL: URL {
         URL(fileURLWithPath: prefix).appendingPathComponent("etc/nginx")
     }
+    static var varMySQLURL: URL {
+        URL(fileURLWithPath: prefix).appendingPathComponent("var/mysql")
+    }
 
     private static var environment: [String: String] {
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()

@@ -86,7 +86,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     /// The menu bar shows the elephant only. State is carried by its appearance:
-    /// dimmed while a switch is running, orange when the CLI and FPM disagree.
+    /// dimmed while a switch is running, orange when the CLI and FPM disagree,
+    /// or when MySQL is installed and its CLI and server disagree.
     private func renderTitle() {
         guard let button = statusItem.button else { return }
         button.attributedTitle = NSAttributedString(string: "")
@@ -107,9 +108,14 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
 
         let agrees = state.linkedFormula != nil && state.linkedFormula == state.fpmFormula
-        button.image = agrees ? Self.icon : Self.tinted(.systemOrange)
-        button.toolTip = "CLI  \(state.linkedVersion.map { "PHP \($0)" } ?? "not linked")\n"
+        button.image = agrees && state.mysql.isHealthy ? Self.icon : Self.tinted(.systemOrange)
+        var tip = "CLI  \(state.linkedVersion.map { "PHP \($0)" } ?? "not linked")\n"
             + "FPM  \(state.fpmVersion.map { "PHP \($0)" } ?? "stopped")"
+        if state.mysql.isInstalled {
+            tip += "\nMySQL CLI     \(state.mysql.linkedVersion ?? "not linked")\n"
+                + "MySQL server  \(state.mysql.serverVersion ?? "stopped")"
+        }
+        button.toolTip = tip
     }
 
     // MARK: - Menu
@@ -152,6 +158,10 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 + (isServing ? "\nFPM running" : "")
             item.isEnabled = !busy
             menu.addItem(item)
+        }
+
+        if state.mysql.isInstalled {
+            addMySQLSection()
         }
 
         menu.addItem(.separator())
@@ -199,6 +209,68 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Quit PHPSwitcher", action: #selector(quit), keyEquivalent: "q").targeting(self))
     }
 
+    /// Header with the live versions, one item per mysql keg, then Restart MySQL.
+    private func addMySQLSection() {
+        let mysql = state.mysql
+        menu.addItem(.separator())
+        let cliText = mysql.linkedVersion.map { "CLI \($0)" } ?? "CLI not linked"
+        let serverText = mysql.serverVersion.map { "Server \($0)" } ?? "Server stopped"
+        menu.addItem(disabledItem("MySQL  \(cliText)     \(serverText)"))
+
+        for install in mysql.installs {
+            let item = NSMenuItem(
+                title: "\(install.shortVersion)   (\(install.formula))",
+                action: #selector(selectMySQLVersion(_:)),
+                keyEquivalent: ""
+            ).targeting(self)
+            item.representedObject = install.formula
+            let isLinked = mysql.linkedFormula == install.formula
+            let isServing = mysql.serverFormula == install.formula
+            item.state = isLinked && isServing ? .on : (isLinked || isServing ? .mixed : .off)
+            item.toolTip = "MySQL \(install.version)"
+                + (isLinked ? "\nCLI linked" : "")
+                + (isServing ? "\nServer running" : "")
+                + "\nData: \(MySQLDetector.dataDir(for: install.formula).path) "
+                + "(\(mysql.dataVersions[install.formula] ?? "not created yet"))"
+            item.isEnabled = !busy
+            menu.addItem(item)
+        }
+
+        if let target = MySQLCopy.targetFormula.flatMap(mysql.install(named:)) {
+            menu.addItem(copyDatabaseItem(into: target))
+        }
+
+        let restart = NSMenuItem(title: "Restart MySQL", action: #selector(restartMySQL), keyEquivalent: "")
+            .targeting(self)
+        restart.isEnabled = !busy && (mysql.serverFormula ?? mysql.linkedFormula) != nil
+        menu.addItem(restart)
+    }
+
+    /// "Copy Database to 8.4 ▸" — one item per database in the shared data dir, checked when
+    /// the separate dir already has it.
+    private func copyDatabaseItem(into target: Keg) -> NSMenuItem {
+        let item = NSMenuItem(title: "Copy Database to \(target.shortVersion)", action: nil, keyEquivalent: "")
+        item.isEnabled = !busy
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        let existing = Set(MySQLCopy.databases(in: MySQLDetector.dataDir(for: target.formula)))
+        let names = MySQLCopy.databases(in: Brew.varMySQLURL)
+        if names.isEmpty {
+            submenu.addItem(disabledItem("No databases in \(Brew.varMySQLURL.path)"))
+        }
+        for name in names {
+            let entry = NSMenuItem(title: name, action: #selector(copyDatabase(_:)), keyEquivalent: "")
+                .targeting(self)
+            entry.representedObject = name
+            entry.state = existing.contains(name) ? .on : .off
+            entry.toolTip = existing.contains(name) ? "Already in \(target.shortVersion) — copying replaces it" : nil
+            entry.isEnabled = !busy
+            submenu.addItem(entry)
+        }
+        item.submenu = submenu
+        return item
+    }
+
     private func disabledItem(_ title: String) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
@@ -225,6 +297,115 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 self.refresh {
                     if case .failed(let result) = outcome {
                         self.showFailure(result, while: "switching to PHP \(install.shortVersion)")
+                    }
+                }
+            }
+        }
+    }
+
+    @objc private func selectMySQLVersion(_ sender: NSMenuItem) {
+        guard !busy,
+              let formula = sender.representedObject as? String,
+              let install = state.mysql.install(named: formula),
+              confirmDataDir(for: install) else { return }
+
+        let snapshot = state.mysql
+        setBusy(true, message: "Switching to MySQL \(install.shortVersion)…")
+
+        workQueue.async { [weak self] in
+            let outcome = Switcher.switchMySQL(install, state: snapshot) { message in
+                DispatchQueue.main.async { self?.setBusy(true, message: message) }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.setBusy(false, message: "")
+                self.refresh {
+                    if case .failed(let result) = outcome {
+                        self.showFailure(result, while: "switching to MySQL \(install.shortVersion)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// MySQL upgrades a data dir one way and never downgrades it, and a separate data dir starts
+    /// empty. Asks before any of those; returns whether to go ahead.
+    private func confirmDataDir(for install: Keg) -> Bool {
+        let dir = MySQLDetector.dataDir(for: install.formula)
+        if MySQLDetector.hasSeparateDataDir(install.formula), MySQLDetector.needsInit(install.formula) {
+            return confirm(
+                title: "Create a MySQL \(install.shortVersion) data folder?",
+                message: "MySQL \(install.shortVersion) keeps its own data in \(dir.path). It starts empty "
+                    + "(root, no password); use Copy Database to \(install.shortVersion) to bring databases over.",
+                confirmTitle: "Create",
+                style: .informational
+            )
+        }
+        let data = state.mysql.dataVersions[install.formula] ?? ""
+        switch state.mysql.compatibility(of: install) {
+        case .same, .unknown:
+            return true
+        case .upgrade:
+            return confirm(
+                title: "Upgrade MySQL data to \(install.shortVersion)?",
+                message: "The data in \(dir.path) was last used by MySQL \(data). "
+                    + "Starting \(install.shortVersion) upgrades it in place, and older versions "
+                    + "cannot open it afterwards. Consider a mysqldump first.",
+                confirmTitle: "Upgrade",
+                style: .warning
+            )
+        case .downgrade:
+            return confirm(
+                title: "MySQL \(install.shortVersion) can't open data from \(data)",
+                message: "MySQL does not downgrade a data directory, so the server will refuse to start. "
+                    + "Switch anyway only if you just want the \(install.shortVersion) client.",
+                confirmTitle: "Switch Anyway",
+                style: .critical,
+                confirmIsDefault: false
+            )
+        }
+    }
+
+    @objc private func copyDatabase(_ sender: NSMenuItem) {
+        guard !busy, let name = sender.representedObject as? String,
+              let target = MySQLCopy.targetFormula.flatMap(state.mysql.install(named:)) else { return }
+        if sender.state == .on, !confirm(
+            title: "Replace \(name) in MySQL \(target.shortVersion)?",
+            message: "\(name) already exists in \(MySQLDetector.dataDir(for: target.formula).path). "
+                + "Copying drops it there and loads a fresh copy from the shared data.",
+            confirmTitle: "Replace",
+            style: .warning
+        ) { return }
+
+        let snapshot = state.mysql
+        setBusy(true, message: "Copying \(name) to \(target.shortVersion)…")
+        workQueue.async { [weak self] in
+            let outcome = MySQLCopy.copy(database: name, state: snapshot) { message in
+                DispatchQueue.main.async { self?.setBusy(true, message: message) }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.setBusy(false, message: "")
+                self.refresh {
+                    if case .failed(let result) = outcome {
+                        self.showFailure(result, while: "copying \(name) to MySQL \(target.shortVersion)")
+                    }
+                }
+            }
+        }
+    }
+
+    @objc private func restartMySQL() {
+        guard !busy, let formula = state.mysql.serverFormula ?? state.mysql.linkedFormula else { return }
+        setBusy(true, message: "Restarting \(formula)…")
+        workQueue.async { [weak self] in
+            let outcome = Switcher.restartMySQL(formula)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.setBusy(false, message: "")
+                self.refresh {
+                    if case .failed(let result) = outcome {
+                        self.showFailure(result, while: "restarting \(formula)")
                     }
                 }
             }
@@ -318,6 +499,26 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             message: "\(result.command)\nexit \(result.exitCode)\n\n\(result.message)",
             style: .warning
         )
+    }
+
+    /// Two-button alert. With `confirmIsDefault` false, Cancel is the button Return presses.
+    private func confirm(
+        title: String, message: String, confirmTitle: String,
+        style: NSAlert.Style, confirmIsDefault: Bool = true
+    ) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.messageText = title
+        alert.informativeText = message
+        if confirmIsDefault {
+            alert.addButton(withTitle: confirmTitle)
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: confirmTitle)
+        return alert.runModal() == .alertSecondButtonReturn
     }
 
     private func showAlert(title: String, message: String, style: NSAlert.Style) {
